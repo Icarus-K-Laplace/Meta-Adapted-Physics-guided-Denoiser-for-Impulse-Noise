@@ -1,0 +1,141 @@
+### 🐍 `src/mapd_core.py
+
+包含 `MetaParameterNet`、`FractionalSpectralPrior` 和主修复逻辑。
+
+```python
+import numpy as np
+import cv2
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from .modules import get_valid_neighbors, restore_pixel, multiscale_consistency
+
+# =============================================================================
+# META PARAMETER NET
+# =============================================================================
+
+class MetaParameterNet(nn.Module):
+    def __init__(self, out_dim=6):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(4),
+            nn.Flatten(),
+            nn.Linear(64*4*4, 64), nn.ReLU(),
+            nn.Linear(64, out_dim), nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+def map_params(raw, config):
+    frac_alpha = config["fractional_alpha_bounds"][0] + \
+        raw[0].item() * (config["fractional_alpha_bounds"][1] - config["fractional_alpha_bounds"][0])
+    relax = config["relaxation_bounds"][0] + \
+        raw[1].item() * (config["relaxation_bounds"][1] - config["relaxation_bounds"][0])
+    edge_thr = 0.15 + 0.4 * raw[2].item()
+    cluster_weights = [0.8 + 0.6 * raw[3].item(), 0.9 + 0.4 * raw[4].item(), 1.0 + 0.2 * raw[5].item()]
+    return {
+        "fractional_alpha": float(frac_alpha),
+        "relaxation": float(relax),
+        "edge_threshold": float(edge_thr),
+        "cluster_weights": cluster_weights,
+        "max_iterations": config["max_iterations"],
+        "window_sequence": config["window_sequence"]
+    }
+
+# =============================================================================
+# FRACTIONAL SPECTRAL PRIOR
+# =============================================================================
+
+class FractionalSpectralPrior:
+    def __init__(self):
+        self.cache = {}
+
+    def apply(self, img, alpha):
+        h, w = img.shape
+        key = (h, w, alpha)
+        if key not in self.cache:
+            fx = np.fft.fftfreq(h).reshape(-1, 1)
+            fy = np.fft.fftfreq(w).reshape(1, -1)
+            mag = np.sqrt(fx**2 + fy**2)
+            self.cache[key] = np.power(np.maximum(mag, 1e-6), alpha)
+        filter_ = self.cache[key]
+        fft_img = np.fft.fft2(img.astype(np.float32))
+        response = np.fft.ifft2(fft_img * filter_).real
+        norm = (response - response.min()) / (response.max() - response.min() + 1e-6)
+        return norm.astype(np.float32)
+
+# =============================================================================
+# MAIN MAPD CLASS
+# =============================================================================
+
+class MAPDDenoiser:
+    def __init__(self, config):
+        self.config = config
+        self.meta_net = MetaParameterNet() if config["use_meta_parameter_net"] else None
+        self.frac_prior = FractionalSpectralPrior() if config["use_fractional_prior"] else None
+        
+    def load_meta_model(self, path):
+        if self.meta_net and path:
+            self.meta_net.load_state_dict(torch.load(path, map_location="cpu"))
+            
+    def denoise(self, noisy, mask, features, clusters=None):
+        # 1. Predict Parameters
+        if self.meta_net:
+            self.meta_net.eval()
+            with torch.no_grad():
+                inp = torch.from_numpy(noisy / 255.0).float().unsqueeze(0).unsqueeze(0)
+                raw = self.meta_net(inp)
+            params = map_params(raw[0], self.config)
+        else:
+            params = {
+                "fractional_alpha": 1.5,
+                "relaxation": 0.75,
+                "edge_threshold": 0.25,
+                "cluster_weights": [1.0, 0.9, 1.1],
+                "max_iterations": self.config["max_iterations"],
+                "window_sequence": self.config["window_sequence"]
+            }
+            
+        # 2. Fractional Prior
+        if self.frac_prior:
+            frac_map = self.frac_prior.apply(noisy, params["fractional_alpha"])
+        else:
+            frac_map = np.zeros_like(noisy, dtype=np.float32)
+            
+        # 3. Iterative Restoration
+        result = noisy.astype(np.float32).copy()
+        h, w = noisy.shape
+        noise_coords = np.argwhere(mask == 1)
+        
+        for it in range(params["max_iterations"]):
+            prev = result.copy()
+            for x, y in noise_coords:
+                valid = None
+                for win in params["window_sequence"]:
+                    valid = get_valid_neighbors(result, mask, x, y, win)
+                    if len(valid) >= 4: break
+                if valid is None or len(valid) == 0: continue
+                
+                intensity = features["intensity"][x, y]
+                edge_val = features["edge"][x, y]
+                frac_val = frac_map[x, y]
+                cluster_id = clusters[x, y] if clusters is not None else 0
+                
+                base_weight = 0.1 + 9.9 * intensity
+                if edge_val > params["edge_threshold"]: base_weight *= 0.5
+                base_weight *= (1.0 + 0.3 * frac_val)
+                base_weight *= params["cluster_weights"][cluster_id % 3]
+                base_weight = np.clip(base_weight, 0.05, 15.0)
+                
+                restored = restore_pixel(valid, base_weight)
+                result[x, y] = (1 - params["relaxation"]) * result[x, y] + params["relaxation"] * restored
+            
+            diff = multiscale_consistency(prev, result) if self.config["use_multiscale_consistency"] else np.max(np.abs(result - prev))
+            if diff < 0.3: break
+            
+        return np.clip(result, 0, 255).astype(np.uint8)
