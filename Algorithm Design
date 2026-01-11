@@ -1,0 +1,99 @@
+# Algorithm Design: MAPD (Meta-Adapted Physics-guided Denoiser)
+
+This document outlines the architectural decisions and theoretical motivations behind the MAPD framework. MAPD is designed to bridge the gap between **interpretable classical filtering** and **data-driven adaptation**, specifically for the problem of high-density impulse noise removal.
+
+---
+
+## 1. Design Philosophy
+
+Traditional impulse noise filters (e.g., Adaptive Median Filter, switching median) rely on fixed, heuristic rules. While interpretable, they often lack flexibility when dealing with diverse image structures (e.g., smooth backgrounds vs. complex textures).
+
+Deep learning methods (e.g., CNNs, Transformers) offer high performance but often lack transparency and require extensive training data.
+
+**MAPD proposes a third path:**
+> Use a lightweight neural network to predict **control parameters** for a rigorous, physics-guided restoration process. This keeps the core restoration logic transparent while allowing data-driven adaptability.
+
+---
+
+## 2. Architecture Overview
+
+The MAPD pipeline consists of four coupled modules:
+
+1.  **Feature Extraction**: Computing local structural descriptors.
+2.  **Meta-Parameter Prediction**: Adapting hyperparameters to the global image context.
+3.  **Fractional Spectral Prior**: Enhancing texture preservation via frequency domain filtering.
+4.  **Iterative Restoration**: The core pixel-wise reconstruction loop.
+
+### 2.1 Feature Extraction
+Instead of raw pixels, MAPD operates on statistically normalized features:
+*   **Normalized Intensity**: Sigmoid of the local Z-score, robust to lighting variations.
+*   **Edge Strength**: Normalized gradient magnitude to identify structural boundaries.
+*   **Local Variance**: To distinguish flat regions from textured areas.
+
+### 2.2 Meta-Parameter Network (MPN)
+A lightweight CNN (3 layers) that takes the noisy image (downsampled) as input and outputs a vector of hyperparameters $\theta$:
+$$ \theta = \{ \alpha, \lambda, \tau_{edge}, \mathbf{w}_{cluster} \} = \mathcal{F}_{MPN}(I_{noisy}) $$
+*   $\alpha$: Fractional order for spectral filtering.
+*   $\lambda$: Relaxation factor for iterative updates.
+*   $\tau_{edge}$: Threshold for edge sensitivity.
+
+This allows the algorithm to be "aggressive" on smooth images and "conservative" on textured ones automatically.
+
+### 2.3 Fractional Spectral Prior
+To better preserve textures, we introduce a fractional-order filter in the frequency domain:
+$$ \hat{I}_{prior} = \mathcal{F}^{-1} \left( \mathcal{F}(I) \cdot |k|^\alpha \right) $$
+where $\alpha$ is the fractional order predicted by the MPN. This acts as a soft band-pass filter, highlighting structural information that might be lost in spatial domain filtering.
+
+### 2.4 Structure-Aware Clustering
+Pixels are clustered into $K$ groups based on their feature vectors (intensity, edge, variance, spectral prior).
+$$ C(x,y) = \text{KMeans}([f_{int}, f_{edge}, f_{var}, f_{spec}]) $$
+This allows the restoration logic to apply different weights to different types of regions (e.g., sky vs. building edges).
+
+---
+
+## 3. Core Restoration Logic
+
+For each noisy pixel $(x,y)$, the restoration value $R$ is computed iteratively:
+
+1.  **Weight Calculation**:
+    $$ w = w_{base}(I) \cdot w_{edge}(E) \cdot w_{spec}(S) \cdot w_{cluster}(C) $$
+    The weight $w$ represents the confidence in the local structure.
+
+2.  **Hybrid Estimation**:
+    *   **Polynomial Fit**: A local polynomial surface is fitted to valid neighbors.
+    *   **Robust Median**: The median of valid neighbors.
+
+3.  **Decision Rule**:
+    $$
+    R_{new} = \begin{cases} 
+    \text{PolyFit} & \text{if } w > T_{high} \\
+    \text{Median} & \text{if } w < T_{low} \\
+    \text{Blend} & \text{otherwise}
+    \end{cases}
+    $$
+
+4.  **Relaxation Update**:
+    $$ R^{(t+1)} = (1-\lambda) R^{(t)} + \lambda R_{new} $$
+    This ensures convergence and numerical stability.
+
+---
+
+## 4. Multi-Scale Consistency
+
+To prevent artifacts, we enforce consistency across scales. After each iteration, we check if the update violates structural constraints at a coarser scale (Gaussian pyramid level 1). If the multi-scale difference is small, we assume convergence.
+
+---
+
+## 5. Why This Works
+
+*   **Adaptability**: The MPN adjusts $\alpha$ and $\lambda$ per image, avoiding the "one size fits all" problem of static filters.
+*   **Robustness**: The core decision rule (Polynomial vs. Median) is mathematically grounded and robust to outliers.
+*   **Texture Preservation**: The fractional spectral prior provides global texture cues that local windows cannot capture.
+
+---
+
+## 6. References
+
+*   *Fractional-order image processing* (Conceptual basis for spectral prior)
+*   *Switching median filters* (Basis for the decision rule)
+*   *Meta-learning for image restoration* (Inspiration for the MPN)
