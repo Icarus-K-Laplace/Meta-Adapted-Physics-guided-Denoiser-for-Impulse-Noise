@@ -1,0 +1,75 @@
+import numpy as np
+import cv2
+from sklearn.cluster import MiniBatchKMeans
+
+def extract_features(img):
+    img_f = img.astype(np.float32)
+    local_mean = cv2.GaussianBlur(img_f, (3, 3), 0.5)
+    local_sq = cv2.GaussianBlur(img_f**2, (3, 3), 0.5)
+    local_var = np.maximum(local_sq - local_mean**2, 1e-6)
+    local_std = np.sqrt(local_var)
+    z = (img_f - local_mean) / local_std
+    intensity = (1 / (1 + np.exp(-z))).astype(np.float32)
+
+    gx = cv2.Sobel(img_f, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img_f, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.sqrt(gx**2 + gy**2)
+    edge = (grad / (grad.max() + 1e-6)).astype(np.float32)
+
+    variance = (local_var - local_var.min()) / (local_var.max() - local_var.min() + 1e-6)
+    return {"intensity": intensity, "edge": edge, "variance": variance.astype(np.float32)}
+
+def compute_clusters(features, frac_map=None, n_clusters=3):
+    h, w = features["intensity"].shape
+    if frac_map is None: frac_map = np.zeros((h, w), dtype=np.float32)
+    feat_stack = np.stack(
+        [features["intensity"], features["edge"], features["variance"], frac_map], axis=-1
+    ).reshape(-1, 4)
+    
+    sample_size = min(20000, feat_stack.shape[0])
+    idx = np.random.choice(feat_stack.shape[0], sample_size, replace=False)
+    
+    reducer = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=1000)
+    reducer.fit(feat_stack[idx])
+    clusters = reducer.predict(feat_stack).reshape(h, w)
+    return clusters.astype(np.int32)
+
+def get_valid_neighbors(img, mask, x, y, size):
+    h, w = img.shape
+    half = size // 2
+    xs, xe = max(0, x - half), min(h, x + half + 1)
+    ys, ye = max(0, y - half), min(w, y + half + 1)
+    patch = img[xs:xe, ys:ye]
+    mpatch = mask[xs:xe, ys:ye]
+    return patch[mpatch == 0]
+
+def restore_pixel(valid_pixels, weight):
+    if len(valid_pixels) == 0: return 0
+    neighbor_med = np.median(valid_pixels)
+    if len(valid_pixels) < 6: return neighbor_med
+    
+    x = np.arange(len(valid_pixels))
+    y = np.sort(valid_pixels)
+    coeff = np.polyfit(x, y, 1)
+    fit_vals = np.polyval(coeff, x)
+    fit_med = np.median(fit_vals)
+    
+    if weight > 8.0: return fit_med
+    if weight < 0.3: return neighbor_med
+    alpha = (weight - 0.3) / 7.7
+    return alpha * fit_med + (1 - alpha) * neighbor_med
+
+def multiscale_consistency(prev, current):
+    up_prev = cv2.GaussianBlur(prev, (5, 5), 1.0)
+    up_current = cv2.GaussianBlur(current, (5, 5), 1.0)
+    return np.mean(np.abs(up_prev - up_current))
+
+def detect_noise(img):
+    img = img.astype(np.uint8)
+    extreme = (img <= 10) | (img >= 245)
+    median = cv2.medianBlur(img, 3)
+    diff = np.abs(img.astype(np.int16) - median.astype(np.int16))
+    diff_mask = diff > 20
+    noise = (extreme | diff_mask).astype(np.uint8)
+    kernel = np.ones((3, 3), np.uint8)
+    return cv2.morphologyEx(noise, cv2.MORPH_CLOSE, kernel)
