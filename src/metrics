@@ -1,0 +1,43 @@
+import numpy as np
+import cv2
+from skimage import metrics as sk_metrics
+try:
+    from skimage.feature import phase_congruency
+    HAVE_PC = True
+except ImportError:
+    HAVE_PC = False
+
+def psnr(x, y):
+    mse = np.mean((x.astype(np.float32) - y.astype(np.float32)) ** 2)
+    if mse == 0: return 100.0
+    return 10 * np.log10((255 ** 2) / mse)
+
+def ssim(x, y):
+    return sk_metrics.structural_similarity(x, y)
+
+def fsim(img1, img2):
+    img1 = img1.astype(np.float64) / 255.0
+    img2 = img2.astype(np.float64) / 255.0
+    
+    if HAVE_PC:
+        pc1 = phase_congruency(img1)[0]
+        pc2 = phase_congruency(img2)[0]
+    else:
+        # Fallback approximation
+        pc1 = cv2.Laplacian(img1, cv2.CV_64F)
+        pc2 = cv2.Laplacian(img2, cv2.CV_64F)
+        
+    gx1 = cv2.Sobel(img1, cv2.CV_64F, 1, 0)
+    gy1 = cv2.Sobel(img1, cv2.CV_64F, 0, 1)
+    gm1 = np.sqrt(gx1**2 + gy1**2)
+    
+    gx2 = cv2.Sobel(img2, cv2.CV_64F, 1, 0)
+    gy2 = cv2.Sobel(img2, cv2.CV_64F, 0, 1)
+    gm2 = np.sqrt(gx2**2 + gy2**2)
+    
+    T1, T2 = 0.85, 160.0
+    pc_sim = (2 * pc1 * pc2 + T1) / (pc1**2 + pc2**2 + T1)
+    gm_sim = (2 * gm1 * gm2 + T2) / (gm1**2 + gm2**2 + T2)
+    
+    weight = np.maximum(pc1, pc2)
+    return float(np.sum(pc_sim * gm_sim * weight) / np.sum(weight))
