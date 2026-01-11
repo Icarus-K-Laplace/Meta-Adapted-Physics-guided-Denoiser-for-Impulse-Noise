@@ -1,0 +1,72 @@
+import os
+import time
+import json
+import numpy as np
+import cv2
+from src.mapd_core import MAPDDenoiser
+from src.modules import extract_features, compute_clusters, detect_noise
+from src.metrics import psnr, ssim, fsim
+
+# CONFIG
+DATA_PATH = r"D:\TEM_LSQ\data\original\new\scene1.png"
+NOISE_LEVELS = [0.2, 0.4, 0.6]
+CONFIG = {
+    "use_meta_parameter_net": True,
+    "use_fractional_prior": True,
+    "use_cluster_conditioner": True,
+    "use_multiscale_consistency": True,
+    "max_iterations": 4,
+    "relaxation_bounds": (0.65, 0.9),
+    "fractional_alpha_bounds": (1.2, 1.8),
+    "cluster_count": 3,
+    "window_sequence": [3, 5, 7],
+    "edge_threshold": 0.25
+}
+
+def add_noise(img, density):
+    rng = np.random.default_rng(42)
+    noisy = img.copy()
+    h, w = img.shape
+    n = int(h * w * density)
+    coords = rng.choice(h * w, n, replace=False)
+    rows, cols = coords // w, coords % w
+    noisy[rows[:n//2], cols[:n//2]] = 255
+    noisy[rows[n//2:], cols[n//2:]] = 0
+    mask = np.zeros_like(img)
+    mask[rows, cols] = 1
+    return noisy, mask
+
+def run_benchmark():
+    if not os.path.exists(DATA_PATH):
+        print("Image not found.")
+        return
+
+    clean = cv2.imread(DATA_PATH, 0)
+    denoiser = MAPDDenoiser(CONFIG)
+    
+    print(f"{'Density':<10} {'PSNR':<10} {'SSIM':<10} {'FSIM':<10} {'Time':<10}")
+    print("-" * 55)
+    
+    for density in NOISE_LEVELS:
+        noisy, mask = add_noise(clean, density)
+        
+        start = time.time()
+        # Pipeline
+        features = extract_features(noisy)
+        if CONFIG["use_cluster_conditioner"]:
+            # Mock fractional map for clustering if prior not run yet
+            clusters = compute_clusters(features, np.zeros_like(noisy, dtype=np.float32), 3)
+        else:
+            clusters = None
+            
+        res = denoiser.denoise(noisy, mask, features, clusters)
+        elapsed = time.time() - start
+        
+        p = psnr(clean, res)
+        s = ssim(clean, res)
+        f = fsim(clean, res)
+        
+        print(f"{density:<10.0%} {p:<10.2f} {s:<10.4f} {f:<10.4f} {elapsed:<10.2f}s")
+
+if __name__ == "__main__":
+    run_benchmark()
